@@ -686,7 +686,7 @@ async fn send_outgoing_messages(
         fix_timeouts.reset_heartbeat();
     }
     while let Some((msg, maybe_resp_sender)) = state_machine.outbox_pop() {
-        let is_logout = msg.msg_type() == MsgType::LOGOUT.into();
+        let is_logout = msg.msg_type() == "5";
 
         let msg_seq_num = state_machine.sequences.next_outgoing();
         let msg_buf = build_message_with_headers(msg, msg_seq_num, additional_headers).await?;

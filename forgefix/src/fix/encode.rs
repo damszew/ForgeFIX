@@ -80,7 +80,7 @@ pub fn formatted_time() -> String {
 ///
 /// builder.push_mut(Tags::Symbol, b"TICKER SYMBOL");
 ///
-/// assert_eq!(builder.msg_type(), MsgType::ORDER_SINGLE.into());
+/// assert_eq!(builder.msg_type(), "D");
 ///
 /// # Ok(())
 /// # }
@@ -88,18 +88,59 @@ pub fn formatted_time() -> String {
 #[derive(Debug)]
 pub struct MessageBuilder {
     preamble: Cursor<[u8; 32]>, // e.g. 8=FIX.4.2^9=_________________
-    msg_type: char,
+    msg_type: MsgTypeBuf,
     main_buffer: Cursor<Vec<u8>>,
 }
 
 pub(super) const SOH: &[u8] = &[b'\x01'];
+const MSG_TYPE_MAX: usize = 4;
+
+#[derive(Clone, Copy, Debug)]
+struct MsgTypeBuf {
+    buf: [u8; MSG_TYPE_MAX],
+    len: u8,
+}
+
+impl MsgTypeBuf {
+    fn new(msg_type: &str) -> Self {
+        let bytes = msg_type.as_bytes();
+        assert!(
+            bytes.len() <= MSG_TYPE_MAX,
+            "MsgType length {} exceeds {}",
+            bytes.len(),
+            MSG_TYPE_MAX
+        );
+        let mut buf = [0u8; MSG_TYPE_MAX];
+        buf[..bytes.len()].copy_from_slice(bytes);
+        Self {
+            buf,
+            len: bytes.len() as u8,
+        }
+    }
+
+    fn as_str(&self) -> &str {
+        std::str::from_utf8(&self.buf[..self.len as usize]).unwrap_or("")
+    }
+
+    fn len(&self) -> usize {
+        self.len as usize
+    }
+}
 
 impl MessageBuilder {
-    /// Creates a new [`MessageBuilder`] with `begin_string` and `msg_type`. It is helpful to use
-    /// [`MsgType`] variants for `msg_type`.
+    /// Creates a new [`MessageBuilder`] with `begin_string` and a single-character `msg_type`.
+    /// It is helpful to use [`MsgType`] variants for `msg_type`.
     ///
     /// [`MsgType`]: ../generated/enum.MsgType.html
     pub fn new(begin_string: &str, msg_type: char) -> Self {
+        let mut buf = [0u8; 4];
+        let msg_type = msg_type.encode_utf8(&mut buf);
+        Self::new_with_msg_type(begin_string, msg_type)
+    }
+
+    /// Creates a new [`MessageBuilder`] with `begin_string` and a multi-character `msg_type`.
+    /// This is useful for FIX variants that use multi-byte MsgType values (e.g. "AB", "AC").
+    pub fn new_with_msg_type(begin_string: &str, msg_type: impl AsRef<str>) -> Self {
         let mut writer = Cursor::new([0_u8; 32]);
         writer
             .write_fmt(format_args!("8={}\x019=", begin_string))
@@ -108,7 +149,7 @@ impl MessageBuilder {
 
         MessageBuilder {
             preamble: writer,
-            msg_type,
+            msg_type: MsgTypeBuf::new(msg_type.as_ref()),
             main_buffer,
         }
     }
@@ -136,7 +177,7 @@ impl MessageBuilder {
 
     fn body_len(&self) -> usize {
         let body_len = self.main_buffer.position() as usize;
-        let msg_type_len = 5;
+        let msg_type_len = 4 + self.msg_type.len();
         body_len + msg_type_len
     }
 
@@ -161,7 +202,7 @@ impl MessageBuilder {
             (body_len + additional_headers.len() + msg_seq_num_str.len()).to_string();
         writer.write_all(body_len_str.as_bytes()).await?;
         writer.write_all(SOH).await?;
-        let msg_type_str = format!("35={}\x01", self.msg_type);
+        let msg_type_str = format!("35={}\x01", self.msg_type.as_str());
         writer.write_all(msg_type_str.as_bytes()).await?;
         writer.write_all(msg_seq_num_str.as_bytes()).await?;
 
@@ -179,8 +220,8 @@ impl MessageBuilder {
     }
 
     /// Gets the `MsgType(35)` of this builder
-    pub fn msg_type(&self) -> char {
-        self.msg_type
+    pub fn msg_type(&self) -> &str {
+        self.msg_type.as_str()
     }
 }
 
