@@ -9,20 +9,20 @@ use tokio::io::AsyncWriteExt;
 use tokio::net::TcpStream;
 use tokio::sync::{mpsc, oneshot};
 
-use anyhow::{Result, bail};
+use anyhow::{bail, Result};
 use thiserror::Error;
 
 use crate::fix::decode::{parse_field, parse_sending_time};
 use crate::fix::encode::{AdditionalHeaders, MessageBuilder, SerializedInt};
 use crate::fix::generated::{
-    GapFillFlag, PossDupFlag, SessionRejectReason, Tags, is_session_message,
+    is_session_message, GapFillFlag, PossDupFlag, SessionRejectReason, Tags,
 };
 use crate::fix::log::{FileLogger, Logger};
 use crate::fix::resend::Transformer;
 use crate::fix::session::{Event, MyStateMachine};
 use crate::fix::stopwatch::FixTimeouts;
 use crate::fix::validate::validate_msg;
-use crate::{FixEngineType, Request, SessionSettings};
+use crate::{FixEngineType, InitiatorLogonContext, Request, SessionSettings};
 use store::Store;
 
 use generated::MsgType;
@@ -79,6 +79,8 @@ enum SessionError {
     ResendError,
     #[error("TCP peer closed their half of the connection")]
     TcpDisconnection,
+    #[error("failed to customize outbound logon: {0}")]
+    LogonCustomize(String),
 }
 
 #[derive(Debug)]
@@ -340,6 +342,7 @@ pub(super) async fn spin_session(
             &mut state_machine,
             &mut stream,
             &additional_headers,
+            &settings,
             &store,
             Arc::clone(&epoch),
             &mut logger,
@@ -439,12 +442,10 @@ fn handle_req(
             expected_inbound,
         } => {
             // Set the sequence numbers directly in the state machine
-            state_machine.sequences.set_both(next_outbound, expected_inbound);
-            let result = store.set_sequences(
-                Arc::clone(epoch),
-                next_outbound,
-                expected_inbound,
-            );
+            state_machine
+                .sequences
+                .set_both(next_outbound, expected_inbound);
+            let result = store.set_sequences(Arc::clone(epoch), next_outbound, expected_inbound);
             if let Err(e) = &result {
                 eprintln!("{e}: error setting sequence numbers");
             }
@@ -589,7 +590,8 @@ async fn handle_msg(
                         state_machine.sequences.peek_outgoing() - 1,
                     )
                     .await?;
-                resend_messages(prev_messages, stream, additional_headers, logger).await?;
+                resend_messages(prev_messages, stream, additional_headers, settings, logger)
+                    .await?;
             }
             state_machine.handle(&Event::ResendRequestReceived(
                 cb.msg_seq_num,
@@ -677,6 +679,7 @@ async fn send_outgoing_messages(
     state_machine: &mut MyStateMachine,
     stream: &mut TcpStream,
     additional_headers: &AdditionalHeaders,
+    settings: &SessionSettings,
     store: &Store,
     epoch: Arc<String>,
     logger: &mut impl Logger,
@@ -689,7 +692,8 @@ async fn send_outgoing_messages(
         let is_logout = msg.msg_type() == "5";
 
         let msg_seq_num = state_machine.sequences.next_outgoing();
-        let msg_buf = build_message_with_headers(msg, msg_seq_num, additional_headers).await?;
+        let msg_buf =
+            build_message_with_headers(msg, msg_seq_num, additional_headers, settings).await?;
         stream::send_message(&msg_buf, stream, logger).await?;
 
         store
@@ -726,6 +730,7 @@ async fn resend_messages(
     mut messages: Vec<(u32, Vec<u8>)>,
     stream: &mut TcpStream,
     additional_headers: &AdditionalHeaders,
+    settings: &SessionSettings,
     logger: &mut impl Logger,
 ) -> Result<(), SessionError> {
     messages.sort_by(|(a, _), (b, _)| a.cmp(b));
@@ -743,6 +748,7 @@ async fn resend_messages(
                 msg_seq_num - session_msg_count,
                 *msg_seq_num,
                 additional_headers,
+                settings,
             )
             .await?;
             stream::send_message(&msg_buf, stream, logger).await?;
@@ -757,6 +763,7 @@ async fn resend_messages(
             last_seq_num - session_msg_count + 1,
             last_seq_num + 1,
             additional_headers,
+            settings,
         )
         .await?;
         stream::send_message(&msg_buf, stream, logger).await?;
@@ -768,25 +775,58 @@ async fn build_message_with_headers(
     msg: MessageBuilder,
     msg_seq_num: u32,
     additional_headers: &AdditionalHeaders,
+    settings: &SessionSettings,
 ) -> Result<MsgBuf, SessionError> {
     let mut buf = Vec::new();
     let mut cur = tokio::io::BufWriter::new(&mut buf);
+    let sending_time = Utc::now();
+    let msg = customize_initiator_logon(msg, msg_seq_num, sending_time, settings)?;
 
-    msg.build_async(&mut cur, msg_seq_num, additional_headers, Utc::now())
+    msg.build_async(&mut cur, msg_seq_num, additional_headers, sending_time)
         .await?;
     cur.flush().await?;
     Ok(buf.into())
+}
+
+fn customize_initiator_logon(
+    mut msg: MessageBuilder,
+    msg_seq_num: u32,
+    sending_time: DateTime<Utc>,
+    settings: &SessionSettings,
+) -> Result<MessageBuilder, SessionError> {
+    if !matches!(settings.engine_type, FixEngineType::Client) || msg.msg_type() != "A" {
+        return Ok(msg);
+    }
+
+    let Some(hook) = settings.initiator_logon_hook.as_ref() else {
+        return Ok(msg);
+    };
+
+    let ctx = InitiatorLogonContext {
+        begin_string: &settings.begin_string,
+        sender_comp_id: &settings.sender_comp_id,
+        target_comp_id: &settings.target_comp_id,
+        msg_seq_num,
+        sending_time,
+        heart_bt_int_secs: settings.heartbeat_timeout.as_secs() as u32,
+    };
+
+    hook.customize(&ctx, &mut msg)
+        .map_err(|err| SessionError::LogonCustomize(err.to_string()))?;
+    Ok(msg)
 }
 
 async fn build_gap_fill_msg(
     msg_seq_num: u32,
     new_seq_num: u32,
     additional_headers: &AdditionalHeaders,
+    settings: &SessionSettings,
 ) -> Result<MsgBuf, SessionError> {
     let builder = MessageBuilder::new("FIX.4.2", MsgType::SEQUENCE_RESET.into())
         .push(Tags::NewSeqNo, SerializedInt::from(new_seq_num).as_bytes())
         .push(Tags::GapFillFlag, b"Y");
-    let msg = build_message_with_headers(builder, msg_seq_num, additional_headers).await?;
+    let msg =
+        build_message_with_headers(builder, msg_seq_num, additional_headers, settings).await?;
     let transformer = Transformer::try_from(msg.0)?;
     transform_message(transformer).await
 }
@@ -819,7 +859,40 @@ async fn is_new_session(store: &Store, settings: &SessionSettings) -> Result<boo
 mod test {
     use super::*;
     use crate::fix::decode::ParsedPeek;
+    use crate::fix::encode::AdditionalHeaders;
+    use crate::fix::generated::Tags;
+    use crate::InitiatorLogonHook;
+    use anyhow::Result as AnyhowResult;
+    use std::net::SocketAddr;
+    use std::path::PathBuf;
+    use std::sync::Arc;
     use tokio::io::{AsyncReadExt, BufReader};
+
+    struct EchoLogonHook;
+
+    impl InitiatorLogonHook for EchoLogonHook {
+        fn customize(
+            &self,
+            ctx: &crate::InitiatorLogonContext<'_>,
+            builder: &mut MessageBuilder,
+        ) -> AnyhowResult<()> {
+            let payload = format!(
+                "{}|{}|{}|{}|{}",
+                ctx.msg_seq_num,
+                ctx.sending_time.format(crate::fix::encode::TIME_FORMAT),
+                ctx.sender_comp_id,
+                ctx.target_comp_id,
+                ctx.heart_bt_int_secs
+            );
+            builder.push_mut(1137u32, b"9");
+            builder.push_mut(
+                Tags::RawDataLength,
+                SerializedInt::from(payload.len() as u32).as_bytes(),
+            );
+            builder.push_mut(Tags::RawData, payload.as_bytes());
+            Ok(())
+        }
+    }
     #[tokio::test]
     async fn my_test() {
         let message_bytes = vec![
@@ -903,5 +976,49 @@ mod test {
             .is_err(),
             false
         );
+    }
+
+    #[tokio::test]
+    async fn initiator_logon_hook_can_use_final_header_context() {
+        let settings = SessionSettings::builder()
+            .with_sender_comp_id("sender")
+            .with_target_comp_id("target")
+            .with_socket_addr("127.0.0.1:9000".parse::<SocketAddr>().expect("socket addr"))
+            .with_store_path(PathBuf::from("/tmp/forgefix-test-store.db"))
+            .with_log_dir(PathBuf::from("/tmp/forgefix-test-logs"))
+            .with_begin_string("FIXT.1.1")
+            .with_heartbeat_timeout(Duration::from_secs(30))
+            .with_initiator_logon_hook(Arc::new(EchoLogonHook))
+            .build()
+            .expect("settings build");
+        let additional_headers = AdditionalHeaders::build(&settings);
+        let msg_buf = build_message_with_headers(
+            crate::fix::session::build_logon_message("FIXT.1.1", 30),
+            7,
+            &additional_headers,
+            &settings,
+        )
+        .await
+        .expect("message build");
+        let encoded = String::from_utf8(msg_buf.0).expect("utf8 message");
+
+        assert!(encoded.contains("35=A\x01"));
+        assert!(encoded.contains("34=7\x01"));
+        assert!(encoded.contains("49=sender\x01"));
+        assert!(encoded.contains("56=target\x01"));
+        assert!(encoded.contains("1137=9\x01"));
+        let raw_data = encoded
+            .split('\x01')
+            .find_map(|field| field.strip_prefix("96="))
+            .expect("raw data field");
+        let raw_data_len = encoded
+            .split('\x01')
+            .find_map(|field| field.strip_prefix("95="))
+            .expect("raw data length field")
+            .parse::<usize>()
+            .expect("raw data length is numeric");
+        assert_eq!(raw_data_len, raw_data.len());
+        assert!(raw_data.starts_with("7|"));
+        assert!(raw_data.contains("|sender|target|30"));
     }
 }

@@ -118,7 +118,9 @@ use thiserror::Error;
 use tokio::net::{TcpListener, TcpSocket, TcpStream};
 use tokio::sync::{mpsc, oneshot};
 
+use anyhow::Result as AnyhowResult;
 use chrono::naive::NaiveTime;
+use chrono::{DateTime, Utc};
 
 enum Request {
     Logon {
@@ -157,11 +159,24 @@ pub enum ApplicationError {
     SettingRequired(String),
 }
 
-/// Extra FIX field appended to the outbound Logon message.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct LogonField {
-    pub tag: u32,
-    pub value: String,
+/// Context available when customizing an outbound initiator `Logon<A>`.
+#[derive(Clone, Copy, Debug)]
+pub struct InitiatorLogonContext<'a> {
+    pub begin_string: &'a str,
+    pub sender_comp_id: &'a str,
+    pub target_comp_id: &'a str,
+    pub msg_seq_num: u32,
+    pub sending_time: DateTime<Utc>,
+    pub heart_bt_int_secs: u32,
+}
+
+/// Hook for customizing outbound initiator `Logon<A>` messages.
+pub trait InitiatorLogonHook: Send + Sync {
+    fn customize(
+        &self,
+        ctx: &InitiatorLogonContext<'_>,
+        builder: &mut MessageBuilder,
+    ) -> AnyhowResult<()>;
 }
 
 /// A collection of settings used to configurate a FIX session.
@@ -179,7 +194,7 @@ pub struct SessionSettings {
     log_dir: PathBuf,
     heartbeat_timeout: Duration,
     start_time: NaiveTime,
-    logon_fields: Arc<Vec<LogonField>>,
+    initiator_logon_hook: Option<Arc<dyn InitiatorLogonHook>>,
 }
 
 /// A builder for easily configuring all the fields of a [`SessionSettings`]
@@ -201,7 +216,7 @@ pub struct SessionSettingsBuilder {
     log_dir: Option<PathBuf>,
     heartbeat_timeout: Option<Duration>,
     start_time: Option<NaiveTime>,
-    logon_fields: Vec<LogonField>,
+    initiator_logon_hook: Option<Arc<dyn InitiatorLogonHook>>,
 }
 
 impl SessionSettingsBuilder {
@@ -290,13 +305,16 @@ impl SessionSettingsBuilder {
         self.heartbeat_timeout = Some(hb_timeout);
     }
 
-    /// Additional FIX fields to append to the outbound `Logon<A>` message.
-    pub fn with_logon_fields(mut self, logon_fields: Vec<LogonField>) -> Self {
-        self.set_logon_fields(logon_fields);
+    /// Hook for customizing outbound initiator `Logon<A>` messages.
+    pub fn with_initiator_logon_hook(
+        mut self,
+        initiator_logon_hook: Arc<dyn InitiatorLogonHook>,
+    ) -> Self {
+        self.set_initiator_logon_hook(initiator_logon_hook);
         self
     }
-    pub fn set_logon_fields(&mut self, logon_fields: Vec<LogonField>) {
-        self.logon_fields = logon_fields;
+    pub fn set_initiator_logon_hook(&mut self, initiator_logon_hook: Arc<dyn InitiatorLogonHook>) {
+        self.initiator_logon_hook = Some(initiator_logon_hook);
     }
 
     /// Build the [`SessionSettings`] struct.
@@ -338,7 +356,7 @@ impl SessionSettingsBuilder {
             addr,
             store_path,
             log_dir,
-            logon_fields: Arc::new(self.logon_fields),
+            initiator_logon_hook: self.initiator_logon_hook,
         })
     }
 }
