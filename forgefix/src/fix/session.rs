@@ -1,7 +1,7 @@
 use crate::fix::encode::{MessageBuilder, SerializedInt};
 use crate::fix::generated::{GapFillFlag, MsgType, PossDupFlag, SessionRejectReason, Tags};
 use crate::fix::{GarbledMessageType, SessionError};
-use crate::SessionSettings;
+use crate::{LogonField, SessionSettings};
 use log::{debug, warn};
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -30,6 +30,8 @@ pub(super) struct MyStateMachine {
     pub(super) outbox: VecDeque<(MessageBuilder, Option<oneshot::Sender<bool>>)>, // https://github.com/mdeloof/statig/issues/7
     pub(super) sequences: Sequences,
     pub(super) begin_string: Arc<String>,
+    heartbeat_timeout_secs: u32,
+    logon_fields: Arc<Vec<LogonField>>,
     sender_comp_id: Arc<String>,
     target_comp_id: Arc<String>,
     rereceive_range: Option<(u32, u32)>,
@@ -160,6 +162,8 @@ impl MyStateMachine {
             outbox: VecDeque::new(),
             sequences: seqs.into(),
             begin_string: Arc::clone(&settings.begin_string),
+            heartbeat_timeout_secs: settings.heartbeat_timeout.as_secs() as u32,
+            logon_fields: Arc::clone(&settings.logon_fields),
             sender_comp_id: Arc::new(settings.sender_comp_id().to_string()),
             target_comp_id: Arc::new(settings.target_comp_id().to_string()),
             logon_resp_sender: None,
@@ -543,10 +547,11 @@ impl MyStateMachine {
     fn start(&mut self, event: &Event) -> Response {
         match event {
             Event::Connect(reset_seq_num) => {
-                let mut builder: MessageBuilder =
-                    MessageBuilder::new(&self.begin_string, MsgType::LOGON.into())
-                        .push(Tags::EncryptMethod, b"0")
-                        .push(Tags::HeartBtInt, 30.to_string().as_bytes());
+                let mut builder = build_logon_message(
+                    &self.begin_string,
+                    self.heartbeat_timeout_secs,
+                    &self.logon_fields,
+                );
                 if *reset_seq_num {
                     builder = builder.push(Tags::ResetSeqNumFlag, b"Y");
                     self.reset_sequences();
@@ -596,13 +601,8 @@ impl MyStateMachine {
                     self.send_logon_response(false);
                     return Response::Transition(State::Error);
                 }
-                let mut builder: MessageBuilder =
-                    MessageBuilder::new(&self.begin_string, MsgType::LOGON.into())
-                        .push(Tags::EncryptMethod, b"0")
-                        .push(
-                            Tags::HeartBtInt,
-                            SerializedInt::from(*heart_bt_int).as_bytes(),
-                        );
+                let mut builder =
+                    build_logon_message(&self.begin_string, *heart_bt_int, &self.logon_fields);
                 if *reset_seq_num {
                     builder = builder.push(Tags::ResetSeqNumFlag, b"Y");
                     self.reset_sequences();
@@ -711,6 +711,23 @@ pub(super) fn build_logout_message(begin_string: &str) -> MessageBuilder {
     MessageBuilder::new(begin_string, MsgType::LOGOUT.into())
 }
 
+pub(super) fn build_logon_message(
+    begin_string: &str,
+    heartbeat_timeout_secs: u32,
+    logon_fields: &[LogonField],
+) -> MessageBuilder {
+    let mut builder = MessageBuilder::new(begin_string, MsgType::LOGON.into())
+        .push(Tags::EncryptMethod, b"0")
+        .push(
+            Tags::HeartBtInt,
+            SerializedInt::from(heartbeat_timeout_secs).as_bytes(),
+        );
+    for field in logon_fields {
+        builder = builder.push(field.tag, field.value.as_bytes());
+    }
+    builder
+}
+
 fn build_message_reject(
     text: &String,
     reject_reason: &Option<SessionRejectReason>,
@@ -777,5 +794,68 @@ impl Sequences {
 impl From<(u32, u32)> for Sequences {
     fn from((incoming, outgoing): (u32, u32)) -> Self {
         Sequences(outgoing.into(), incoming.into())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_logon_message;
+    use crate::fix::encode::AdditionalHeaders;
+    use crate::LogonField;
+
+    async fn encode_message(builder: crate::fix::encode::MessageBuilder) -> String {
+        let mut buf = Vec::new();
+        let mut writer = tokio::io::BufWriter::new(&mut buf);
+        builder
+            .build_async(
+                &mut writer,
+                1,
+                &AdditionalHeaders::default(),
+                std::time::UNIX_EPOCH.into(),
+            )
+            .await
+            .expect("message should encode");
+        tokio::io::AsyncWriteExt::flush(&mut writer)
+            .await
+            .expect("writer should flush");
+        String::from_utf8(buf).expect("encoded FIX should be UTF-8")
+    }
+
+    #[tokio::test]
+    async fn build_logon_message_uses_default_fields() {
+        let encoded = encode_message(build_logon_message("FIX.4.2", 30, &[])).await;
+
+        assert!(encoded.contains("8=FIX.4.2\x01"));
+        assert!(encoded.contains("35=A\x01"));
+        assert!(encoded.contains("98=0\x01"));
+        assert!(encoded.contains("108=30\x01"));
+    }
+
+    #[tokio::test]
+    async fn build_logon_message_appends_custom_fields_in_order() {
+        let encoded = encode_message(build_logon_message(
+            "FIXT.1.1",
+            45,
+            &[
+                LogonField {
+                    tag: 1137,
+                    value: "9".to_string(),
+                },
+                LogonField {
+                    tag: 554,
+                    value: "sekret".to_string(),
+                },
+            ],
+        ))
+        .await;
+
+        assert!(encoded.contains("8=FIXT.1.1\x01"));
+        let heart_bt_int_at = encoded.find("108=45\x01").expect("HeartBtInt present");
+        let appl_ver_at = encoded
+            .find("1137=9\x01")
+            .expect("DefaultApplVerID present");
+        let password_at = encoded.find("554=sekret\x01").expect("Password present");
+        assert!(heart_bt_int_at < appl_ver_at);
+        assert!(appl_ver_at < password_at);
     }
 }

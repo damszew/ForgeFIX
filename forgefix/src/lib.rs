@@ -157,6 +157,13 @@ pub enum ApplicationError {
     SettingRequired(String),
 }
 
+/// Extra FIX field appended to the outbound Logon message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct LogonField {
+    pub tag: u32,
+    pub value: String,
+}
+
 /// A collection of settings used to configurate a FIX session.
 ///
 /// `SessionSettings` can be constructed using the [`SessionSettingsBuilder`], or can be constructed explicitly.
@@ -172,6 +179,7 @@ pub struct SessionSettings {
     log_dir: PathBuf,
     heartbeat_timeout: Duration,
     start_time: NaiveTime,
+    logon_fields: Arc<Vec<LogonField>>,
 }
 
 /// A builder for easily configuring all the fields of a [`SessionSettings`]
@@ -193,6 +201,7 @@ pub struct SessionSettingsBuilder {
     log_dir: Option<PathBuf>,
     heartbeat_timeout: Option<Duration>,
     start_time: Option<NaiveTime>,
+    logon_fields: Vec<LogonField>,
 }
 
 impl SessionSettingsBuilder {
@@ -281,6 +290,15 @@ impl SessionSettingsBuilder {
         self.heartbeat_timeout = Some(hb_timeout);
     }
 
+    /// Additional FIX fields to append to the outbound `Logon<A>` message.
+    pub fn with_logon_fields(mut self, logon_fields: Vec<LogonField>) -> Self {
+        self.set_logon_fields(logon_fields);
+        self
+    }
+    pub fn set_logon_fields(&mut self, logon_fields: Vec<LogonField>) {
+        self.logon_fields = logon_fields;
+    }
+
     /// Build the [`SessionSettings`] struct.
     ///
     /// Returns an `Err(ApplicationError::SettingRequired)` if not all of the required fields
@@ -309,13 +327,10 @@ impl SessionSettingsBuilder {
         Ok(SessionSettings {
             engine_type: FixEngineType::Client,
             begin_string: Arc::new(self.begin_string.unwrap_or(String::from("FIX.4.2"))),
-            epoch: Arc::new(
-                self.epoch
-                    .unwrap_or(SessionSettings::default_epoch(
-                        &sender_comp_id,
-                        &target_comp_id,
-                    )),
-            ),
+            epoch: Arc::new(self.epoch.unwrap_or(SessionSettings::default_epoch(
+                &sender_comp_id,
+                &target_comp_id,
+            ))),
             heartbeat_timeout: self.heartbeat_timeout.unwrap_or(Duration::from_secs(30)),
             start_time: self.start_time.unwrap_or_default(),
             sender_comp_id,
@@ -323,6 +338,7 @@ impl SessionSettingsBuilder {
             addr,
             store_path,
             log_dir,
+            logon_fields: Arc::new(self.logon_fields),
         })
     }
 }
@@ -356,7 +372,6 @@ impl SessionSettings {
         &self.target_comp_id
     }
 
-
     fn expected_sender_comp_id(&self) -> &str {
         &self.target_comp_id
     }
@@ -380,10 +395,7 @@ pub fn set_persisted_sequence_numbers(
         next_outbound,
         expected_inbound,
     )
-    .map_err(|e| ApplicationError::IoError(std::io::Error::new(
-        std::io::ErrorKind::Other,
-        e,
-    )))
+    .map_err(|e| ApplicationError::IoError(std::io::Error::new(std::io::ErrorKind::Other, e)))
 }
 
 /// A handle on a FIX engine instance.
