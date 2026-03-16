@@ -459,24 +459,42 @@ pub(super) struct ParsedPeek {
     pub body_length: usize,
 }
 pub(super) fn parse_peeked_prefix(peeked: &[u8]) -> result::Result<ParsedPeek, SessionError> {
-    const EXPECTED_PREFIX: &[u8] = b"8=FIX.4.2\x019=";
-    if &peeked[..2] == b"8=" && &peeked[2..9] != b"FIX.4.2" {
+    if peeked.len() < 5 || &peeked[..2] != b"8=" {
+        return Err(SessionError::new_garbled_message(
+            String::from("BeginString not first"),
+            GarbledMessageType::Other,
+        ));
+    }
+
+    let begin_string_end = peeked[2..]
+        .iter()
+        .position(|b| *b == b'\x01')
+        .map(|idx| idx + 2)
+        .ok_or_else(|| {
+            SessionError::new_garbled_message(
+                String::from("BeginString not first"),
+                GarbledMessageType::Other,
+            )
+        })?;
+
+    if !peeked[2..begin_string_end].starts_with(b"FIX") {
         return Err(SessionError::new_garbled_message(
             String::from("Incorrect BeginString"),
             GarbledMessageType::BeginStringIssue,
         ));
     }
 
-    if &peeked[..EXPECTED_PREFIX.len()] != EXPECTED_PREFIX {
+    if peeked.get(begin_string_end + 1..begin_string_end + 3) != Some(b"9=".as_slice()) {
         return Err(SessionError::new_garbled_message(
             String::from("BeginString not first"),
             GarbledMessageType::Other,
         ));
     }
-    let mut at = EXPECTED_PREFIX.len();
+    let len_start = begin_string_end + 3;
+    let mut at = len_start;
     let mut body_length: usize = 0;
     let mut saw_end = false;
-    for c in peeked[EXPECTED_PREFIX.len()..].iter() {
+    for c in peeked[len_start..].iter() {
         at += 1;
         match *c as char {
             '0'..='9' => {
@@ -526,7 +544,7 @@ pub(super) fn parse_peeked_prefix(peeked: &[u8]) -> result::Result<ParsedPeek, S
 
     Ok(ParsedPeek {
         msg_type: msg_type as char,
-        len_start: EXPECTED_PREFIX.len(),
+        len_start,
         len_end,
         fixed_fields_end,
         body_length,
@@ -619,6 +637,16 @@ pub(super) fn parse_sending_time(sending_time_bytes: &[u8]) -> Result<DateTime<U
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn test_parse_peeked_prefix_accepts_fixt_begin_string() {
+        let parsed = parse_peeked_prefix(b"8=FIXT.1.1\x019=57\x0135=A\x0134=1\x0149=ISLD").unwrap();
+        assert_eq!(parsed.msg_type, 'A');
+        assert_eq!(parsed.len_start, 13);
+        assert_eq!(parsed.len_end, 15);
+        assert_eq!(parsed.body_length, 57);
+    }
+
     #[test]
     fn test_body_length_too_long() {
         if let Ok(_) = parse_peeked_prefix(b"8=FIX.4.2\x019=33333333333333333333333") {

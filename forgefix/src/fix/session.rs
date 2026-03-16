@@ -307,6 +307,7 @@ impl MyStateMachine {
             Ok(_) => {}
             Err(msg) => {
                 let builder = build_message_reject(
+                    &self.begin_string,
                     &msg.to_string(),
                     &Some(SessionRejectReason::VALUE_IS_INCORRECT),
                     &msg_seq_num,
@@ -518,6 +519,7 @@ impl MyStateMachine {
             } => {
                 self.sequences.incr_incoming();
                 self.outbox_push(build_message_reject(
+                    &self.begin_string,
                     text,
                     reject_reason,
                     msg_seq_num,
@@ -718,13 +720,14 @@ pub(super) fn build_logon_message(
 }
 
 fn build_message_reject(
+    begin_string: &str,
     text: &String,
     reject_reason: &Option<SessionRejectReason>,
     msg_seq_num: &u32,
     ref_tag_id: &Option<u32>,
     ref_msg_type: &Option<char>,
 ) -> MessageBuilder {
-    let mut builder: MessageBuilder = MessageBuilder::new("FIX.4.2", MsgType::REJECT.into())
+    let mut builder: MessageBuilder = MessageBuilder::new(begin_string, MsgType::REJECT.into())
         .push(
             Tags::RefSeqNum,
             SerializedInt::from(*msg_seq_num).as_bytes(),

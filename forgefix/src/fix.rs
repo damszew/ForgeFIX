@@ -822,7 +822,7 @@ async fn build_gap_fill_msg(
     additional_headers: &AdditionalHeaders,
     settings: &SessionSettings,
 ) -> Result<MsgBuf, SessionError> {
-    let builder = MessageBuilder::new("FIX.4.2", MsgType::SEQUENCE_RESET.into())
+    let builder = MessageBuilder::new(&settings.begin_string, MsgType::SEQUENCE_RESET.into())
         .push(Tags::NewSeqNo, SerializedInt::from(new_seq_num).as_bytes())
         .push(Tags::GapFillFlag, b"Y");
     let msg =
@@ -1020,5 +1020,28 @@ mod test {
         assert_eq!(raw_data_len, raw_data.len());
         assert!(raw_data.starts_with("7|"));
         assert!(raw_data.contains("|sender|target|30"));
+    }
+
+    #[tokio::test]
+    async fn gap_fill_uses_session_begin_string() {
+        let settings = SessionSettings::builder()
+            .with_sender_comp_id("sender")
+            .with_target_comp_id("target")
+            .with_socket_addr("127.0.0.1:9000".parse::<SocketAddr>().expect("socket addr"))
+            .with_store_path(PathBuf::from("/tmp/forgefix-test-store.db"))
+            .with_log_dir(PathBuf::from("/tmp/forgefix-test-logs"))
+            .with_begin_string("FIXT.1.1")
+            .build()
+            .expect("settings build");
+        let additional_headers = AdditionalHeaders::build(&settings);
+        let msg_buf = build_gap_fill_msg(2, 85, &additional_headers, &settings)
+            .await
+            .expect("gap fill build");
+        let encoded = String::from_utf8(msg_buf.0).expect("utf8 message");
+
+        assert!(encoded.starts_with("8=FIXT.1.1\x01"));
+        assert!(encoded.contains("35=4\x01"));
+        assert!(encoded.contains("123=Y\x01"));
+        assert!(encoded.contains("36=85\x01"));
     }
 }
