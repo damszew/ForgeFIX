@@ -370,6 +370,8 @@ pub(super) async fn spin_session(
         let (timeout_fut, timeout_event) = next_timeout.timeout();
 
         tokio::select! {
+            biased;
+
             maybe_err = stream::read_header(&mut stream, &mut header_buf) => {
                 let maybe_message = match maybe_err {
                     Ok(()) => stream::read_message(&mut stream, &mut header_buf, &mut logger).await,
