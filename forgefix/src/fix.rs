@@ -33,8 +33,6 @@ use std::io;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-type DynLogger = Arc<dyn Logger + Send + Sync + 'static>;
-
 pub mod decode;
 pub mod encode;
 pub mod generated;
@@ -301,13 +299,16 @@ impl SessionParserCallback<'_> {
     }
 }
 
-pub(super) async fn spin_session(
+pub(super) async fn spin_session<L>(
     mut stream: TcpStream,
     mut request_receiver: mpsc::UnboundedReceiver<Request>,
     message_received_event_sender: mpsc::UnboundedSender<Arc<MsgBuf>>,
     settings: SessionSettings,
-    logger: DynLogger,
-) -> Result<()> {
+    logger: L,
+) -> Result<()>
+where
+    L: Logger + Send + Sync + 'static,
+{
     // SETUP
 
     let additional_headers = AdditionalHeaders::build(&settings);
@@ -347,7 +348,7 @@ pub(super) async fn spin_session(
             &settings,
             &store,
             Arc::clone(&epoch),
-            logger.as_ref(),
+            &logger,
             &mut fix_timeouts,
         )
         .await?;
@@ -376,7 +377,7 @@ pub(super) async fn spin_session(
 
             maybe_err = stream::read_header(&mut stream, &mut header_buf) => {
                 let maybe_message = match maybe_err {
-                    Ok(()) => stream::read_message(&mut stream, &mut header_buf, logger.as_ref()).await,
+                    Ok(()) => stream::read_message(&mut stream, &mut header_buf, &logger).await,
                     Err(SessionError::IoError(e)) => bail!("{e:?}"),
                     Err(e) => Err(e),
                 };
@@ -392,7 +393,7 @@ pub(super) async fn spin_session(
                     &store,
                     &settings,
                     &mut stream,
-                    logger.as_ref(),
+                    &logger,
                     &additional_headers,
                     &message_received_event_sender,
                 ).await?;
@@ -459,17 +460,20 @@ fn handle_req(
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn handle_msg(
+async fn handle_msg<L>(
     maybe_msg: Result<MsgBuf, SessionError>,
     state_machine: &mut MyStateMachine,
     fix_timeouts: &mut FixTimeouts,
     store: &Store,
     settings: &SessionSettings,
     stream: &mut TcpStream,
-    logger: &dyn Logger,
+    logger: &L,
     additional_headers: &AdditionalHeaders,
     message_received_event_sender: &mpsc::UnboundedSender<Arc<MsgBuf>>,
-) -> Result<()> {
+) -> Result<()>
+where
+    L: Logger + Send + Sync,
+{
     fix_timeouts.reset_test_request();
 
     let msg = match maybe_msg {
@@ -635,14 +639,17 @@ async fn handle_msg(
     Ok(())
 }
 
-async fn disconnect(
+async fn disconnect<L>(
     mut request_receiver: mpsc::UnboundedReceiver<Request>,
     store: Store,
     epoch: Arc<String>,
     state_machine: &MyStateMachine,
     stream: TcpStream,
-    logger: DynLogger,
-) -> Result<()> {
+    logger: L,
+) -> Result<()>
+where
+    L: Logger + Send + Sync,
+{
     request_receiver.close();
     store.set_sequences(
         epoch,
@@ -679,16 +686,19 @@ async fn receive_logon_request(
     }
 }
 
-async fn send_outgoing_messages(
+async fn send_outgoing_messages<L>(
     state_machine: &mut MyStateMachine,
     stream: &mut TcpStream,
     additional_headers: &AdditionalHeaders,
     settings: &SessionSettings,
     store: &Store,
     epoch: Arc<String>,
-    logger: &dyn Logger,
+    logger: &L,
     fix_timeouts: &mut FixTimeouts,
-) -> Result<(), SessionError> {
+) -> Result<(), SessionError>
+where
+    L: Logger + Send + Sync,
+{
     if !state_machine.outbox.is_empty() {
         fix_timeouts.reset_heartbeat();
     }
@@ -730,13 +740,16 @@ async fn send_outgoing_messages(
     Ok(())
 }
 
-async fn resend_messages(
+async fn resend_messages<L>(
     mut messages: Vec<(u32, Vec<u8>)>,
     stream: &mut TcpStream,
     additional_headers: &AdditionalHeaders,
     settings: &SessionSettings,
-    logger: &dyn Logger,
-) -> Result<(), SessionError> {
+    logger: &L,
+) -> Result<(), SessionError>
+where
+    L: Logger + Send + Sync,
+{
     messages.sort_by(|(a, _), (b, _)| a.cmp(b));
     let mut session_msg_count = 0;
     for (_, (msg_seq_num, msg)) in messages.iter().enumerate() {

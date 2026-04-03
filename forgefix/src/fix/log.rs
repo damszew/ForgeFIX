@@ -22,6 +22,7 @@ enum LoggerRequest {
     Disconnect(oneshot::Sender<Result<(), SessionError>>),
 }
 
+#[derive(Clone)]
 pub struct FileLogger {
     sender: mpsc::UnboundedSender<LoggerRequest>,
 }

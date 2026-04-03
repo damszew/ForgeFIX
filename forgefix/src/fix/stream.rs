@@ -55,13 +55,14 @@ impl<const N: usize> HeaderBuf<N> {
     }
 }
 
-pub(super) async fn read_message<const N: usize, T>(
+pub(super) async fn read_message<const N: usize, T, L>(
     r: &mut T,
     header: &mut HeaderBuf<N>,
-    logger: &dyn Logger,
+    logger: &L,
 ) -> Result<MsgBuf, SessionError>
 where
     T: TryRead + AsyncRead + Unpin,
+    L: Logger,
 {
     let body_len = match decode::parse_header(header.filled()) {
         Ok(n) => n,
@@ -169,11 +170,15 @@ pub(super) async fn disconnect(mut stream: TcpStream) {
     std::mem::drop(stream);
 }
 
-pub(super) async fn send_message<W: AsyncWrite + Unpin>(
+pub(super) async fn send_message<W, L>(
     msg_buf: &MsgBuf,
     r: &mut W,
-    l: &dyn Logger,
-) -> Result<(), SessionError> {
+    l: &L,
+) -> Result<(), SessionError>
+where
+    W: AsyncWrite + Unpin,
+    L: Logger,
+{
     r.write_all(&msg_buf[..]).await.map_err(|e| {
         if e.kind() == std::io::ErrorKind::BrokenPipe {
             SessionError::TcpDisconnection
