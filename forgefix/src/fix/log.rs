@@ -26,6 +26,10 @@ pub(super) struct FileLogger {
 
 pub(super) trait Logger {
     fn log_message(&mut self, msg: &MsgBuf) -> Result<(), SessionError>;
+
+    async fn disconnect(&mut self) -> Result<(), SessionError> {
+        Ok(())
+    }
 }
 
 impl Logger for FileLogger {
@@ -33,6 +37,13 @@ impl Logger for FileLogger {
         let req = LoggerRequest::Log(format!("{}", buf), Instant::now());
         self.sender.send(req).map_err(to_io_err)?;
         Ok(())
+    }
+
+    async fn disconnect(&mut self) -> Result<(), SessionError> {
+        let (sender, receiver) = oneshot::channel();
+        let req = LoggerRequest::Disconnect(sender);
+        self.sender.send(req).map_err(to_io_err)?;
+        receiver.await.map_err(to_io_err)?
     }
 }
 
@@ -78,13 +89,6 @@ impl FileLogger {
         });
 
         Ok(FileLogger { sender })
-    }
-
-    pub(super) async fn disconnect(&mut self) -> Result<(), SessionError> {
-        let (sender, receiver) = oneshot::channel();
-        let req = LoggerRequest::Disconnect(sender);
-        self.sender.send(req).map_err(to_io_err)?;
-        receiver.await.map_err(to_io_err)?
     }
 }
 
