@@ -316,7 +316,7 @@ mod test {
             expected.0,
         );
 
-        let mut incoming_message_bad_header = Cursor::new(b"8=FIX.5.2\x019=67\x0135=A\x0134=1\x0149=ISLD\x0152=20240506-13:59:15.021\x0156=TW\x0198=0\x01108=30\x01141=Y\x0110=003\x01".as_slice());
+        let mut incoming_message_bad_header = Cursor::new(b"8=INVALID\x019=67\x0135=A\x0134=1\x0149=ISLD\x0152=20240506-13:59:15.021\x0156=TW\x0198=0\x01108=30\x01141=Y\x0110=003\x01".as_slice());
         header_buf.clear();
         assert!(
             read_header(&mut incoming_message_bad_header, &mut header_buf)
