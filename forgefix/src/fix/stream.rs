@@ -199,7 +199,7 @@ mod test {
 
     struct MockLogger;
     impl Logger for MockLogger {
-        fn log_message(&mut self, _: &MsgBuf) -> Result<(), SessionError> {
+        fn log_message(&self, _: &MsgBuf) -> Result<(), SessionError> {
             Ok(())
         }
     }

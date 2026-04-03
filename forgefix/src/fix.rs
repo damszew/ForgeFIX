@@ -36,10 +36,10 @@ use std::time::{Duration, Instant};
 pub mod decode;
 pub mod encode;
 pub mod generated;
+pub mod log;
 pub mod mem;
 
 mod checksum;
-mod log;
 mod resend;
 mod session;
 mod stopwatch;
@@ -57,7 +57,7 @@ mod vec_store;
 use vec_store as store;
 
 #[derive(Debug, Error)]
-enum SessionError {
+pub enum SessionError {
     #[error("An I/O error occured: {0}")]
     IoError(#[from] io::Error),
     #[error("A garbled message was received")]
@@ -84,7 +84,7 @@ enum SessionError {
 }
 
 #[derive(Debug)]
-enum GarbledMessageType {
+pub enum GarbledMessageType {
     BeginStringIssue,
     BodyLengthIssue,
     MsgTypeIssue,

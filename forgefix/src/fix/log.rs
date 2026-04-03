@@ -9,6 +9,7 @@ use tokio::fs::{File, OpenOptions};
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
 
+use std::future::Future;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -20,26 +21,26 @@ enum LoggerRequest {
     Disconnect(oneshot::Sender<Result<(), SessionError>>),
 }
 
-pub(super) struct FileLogger {
+pub struct FileLogger {
     sender: mpsc::UnboundedSender<LoggerRequest>,
 }
 
-pub(super) trait Logger {
-    fn log_message(&mut self, msg: &MsgBuf) -> Result<(), SessionError>;
+pub trait Logger {
+    fn log_message(&self, msg: &MsgBuf) -> Result<(), SessionError>;
 
-    async fn disconnect(&mut self) -> Result<(), SessionError> {
-        Ok(())
+    fn disconnect(&self) -> impl Future<Output = Result<(), SessionError>> + Send {
+        std::future::ready(Ok(()))
     }
 }
 
 impl Logger for FileLogger {
-    fn log_message(&mut self, buf: &MsgBuf) -> Result<(), SessionError> {
+    fn log_message(&self, buf: &MsgBuf) -> Result<(), SessionError> {
         let req = LoggerRequest::Log(format!("{}", buf), Instant::now());
         self.sender.send(req).map_err(to_io_err)?;
         Ok(())
     }
 
-    async fn disconnect(&mut self) -> Result<(), SessionError> {
+    async fn disconnect(&self) -> Result<(), SessionError> {
         let (sender, receiver) = oneshot::channel();
         let req = LoggerRequest::Disconnect(sender);
         self.sender.send(req).map_err(to_io_err)?;
@@ -48,7 +49,7 @@ impl Logger for FileLogger {
 }
 
 impl FileLogger {
-    pub(super) async fn build(settings: &SessionSettings) -> Result<FileLogger> {
+    pub async fn build(settings: &SessionSettings) -> Result<FileLogger> {
         let log_path = &settings.log_dir;
         let sendercompid = settings.expected_sender_comp_id();
         let targetcompid = settings.expected_target_comp_id();
