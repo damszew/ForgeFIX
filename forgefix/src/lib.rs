@@ -28,7 +28,7 @@
 //!
 //! #[tokio::main]
 //! async fn main() -> Result<(), ApplicationError> {
-//!     
+//!
 //!     // build session settings
 //!     let settings = SessionSettings::builder()
 //!         .with_sender_comp_id("my_id")
@@ -92,7 +92,7 @@
 //!     // send messages here...
 //!
 //!     fix_handle.end_sync()?;
-//!     
+//!
 //!     Ok(())
 //! }
 //! ```
@@ -107,8 +107,10 @@
 
 pub mod fix;
 use fix::encode::MessageBuilder;
+use fix::log::{FileLogger, Logger};
 use fix::mem::MsgBuf;
 
+use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -121,6 +123,8 @@ use tokio::sync::{mpsc, oneshot};
 use anyhow::Result as AnyhowResult;
 use chrono::naive::NaiveTime;
 use chrono::{DateTime, Utc};
+
+type DynLogger = Arc<dyn Logger + Send + Sync + 'static>;
 
 enum Request {
     Logon {
@@ -490,7 +494,7 @@ pub fn set_persisted_sequence_numbers(
 /// let (res1, res2) = tokio::join!(h1, h2);
 /// res1??;
 /// res2??;
-///     
+///
 /// // end the FIX connection
 /// handle.end_async().await?;
 ///  #   Ok(())
@@ -668,6 +672,7 @@ impl FixApplicationHandle {
 pub struct FixApplicationInitiator {
     settings: SessionSettings,
     stream_factory: StreamFactory,
+    logger: Option<DynLogger>,
 }
 
 impl FixApplicationInitiator {
@@ -681,8 +686,17 @@ impl FixApplicationInitiator {
         let fix_app_client = FixApplicationInitiator {
             settings,
             stream_factory,
+            logger: None,
         };
         Ok(fix_app_client)
+    }
+
+    pub fn with_logger<L>(mut self, logger: L) -> Self
+    where
+        L: Logger + Send + Sync + 'static,
+    {
+        self.logger = Some(Arc::new(logger));
+        self
     }
 
     /// Initiate a TCP connection and start the FIX engine with the current asynchronous runtime.
@@ -706,6 +720,7 @@ impl FixApplicationInitiator {
         let (app_message_event_sender, app_message_event_receiver) =
             mpsc::unbounded_channel::<Arc<MsgBuf>>();
         let begin_string = Arc::clone(&self.settings.begin_string);
+        let logger = resolve_logger(self.logger.clone(), &self.settings).await?;
 
         tokio::spawn(async move {
             if let Err(e) = fix::spin_session(
@@ -713,6 +728,7 @@ impl FixApplicationInitiator {
                 request_receiver,
                 app_message_event_sender,
                 self.settings,
+                logger,
             )
             .await
             {
@@ -739,6 +755,7 @@ impl FixApplicationInitiator {
             mpsc::unbounded_channel::<Arc<MsgBuf>>();
         let begin_string = Arc::clone(&self.settings.begin_string);
         let stream = runtime.block_on(self.stream_factory.stream())?;
+        let logger = runtime.block_on(resolve_logger(self.logger.clone(), &self.settings))?;
 
         std::thread::spawn(move || {
             if let Err(e) = runtime.block_on(fix::spin_session(
@@ -746,6 +763,7 @@ impl FixApplicationInitiator {
                 request_receiver,
                 app_message_event_sender,
                 self.settings,
+                logger,
             )) {
                 eprintln!("{e:?}");
             }
@@ -774,6 +792,7 @@ impl FixApplicationInitiator {
 pub struct FixApplicationAcceptor {
     settings: SessionSettings,
     stream_factory: StreamFactory,
+    logger: Option<DynLogger>,
 }
 
 impl FixApplicationAcceptor {
@@ -787,8 +806,17 @@ impl FixApplicationAcceptor {
         let fix_app_server = FixApplicationAcceptor {
             settings,
             stream_factory,
+            logger: None,
         };
         Ok(fix_app_server)
+    }
+
+    pub fn with_logger<L>(mut self, logger: L) -> Self
+    where
+        L: Logger + Send + Sync + 'static,
+    {
+        self.logger = Some(Arc::new(logger));
+        self
     }
 
     /// Accept an incoming TCP connection and create a FIX engine.
@@ -805,11 +833,17 @@ impl FixApplicationAcceptor {
         let (app_message_event_sender, app_message_event_receiver) =
             mpsc::unbounded_channel::<Arc<MsgBuf>>();
         let begin_string = Arc::clone(&self.settings.begin_string);
+        let logger = resolve_logger(self.logger.clone(), &settings).await?;
 
         tokio::task::spawn(async move {
-            if let Err(e) =
-                fix::spin_session(stream, request_receiver, app_message_event_sender, settings)
-                    .await
+            if let Err(e) = fix::spin_session(
+                stream,
+                request_receiver,
+                app_message_event_sender,
+                settings,
+                logger,
+            )
+            .await
             {
                 eprintln!("{e:?}");
             }
@@ -821,6 +855,19 @@ impl FixApplicationAcceptor {
         };
 
         Ok((handle, app_message_event_receiver))
+    }
+}
+
+async fn resolve_logger(
+    logger: Option<DynLogger>,
+    settings: &SessionSettings,
+) -> Result<DynLogger, ApplicationError> {
+    match logger {
+        Some(logger) => Ok(logger),
+        None => FileLogger::build(settings)
+            .await
+            .map(|logger| Arc::new(logger) as DynLogger)
+            .map_err(|err| ApplicationError::IoError(io::Error::new(io::ErrorKind::Other, err))),
     }
 }
 
