@@ -10,7 +10,6 @@ use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, oneshot};
 
 use std::future::Future;
-use std::pin::Pin;
 use std::time::Instant;
 
 use anyhow::Result;
@@ -30,7 +29,7 @@ pub struct FileLogger {
 pub trait Logger: Send + Sync {
     fn log_message(&self, msg: &MsgBuf) -> Result<(), SessionError>;
 
-    fn disconnect(&self) -> Pin<Box<dyn Future<Output = Result<(), SessionError>> + Send + '_>> {
+    fn disconnect(&self) -> impl Future<Output = Result<(), SessionError>> + Send {
         Box::pin(std::future::ready(Ok(())))
     }
 }
@@ -42,13 +41,11 @@ impl Logger for FileLogger {
         Ok(())
     }
 
-    fn disconnect(&self) -> Pin<Box<dyn Future<Output = Result<(), SessionError>> + Send + '_>> {
-        Box::pin(async move {
-            let (sender, receiver) = oneshot::channel();
-            let req = LoggerRequest::Disconnect(sender);
-            self.sender.send(req).map_err(to_io_err)?;
-            receiver.await.map_err(to_io_err)?
-        })
+    async fn disconnect(&self) -> Result<(), SessionError> {
+        let (sender, receiver) = oneshot::channel();
+        let req = LoggerRequest::Disconnect(sender);
+        self.sender.send(req).map_err(to_io_err)?;
+        receiver.await.map_err(to_io_err)?
     }
 }
 
